@@ -1,117 +1,70 @@
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import ast
-import astor
+import os
+from flask import Flask, render_template, request, redirect, url_for, send_from_directory, flash
+from werkzeug.utils import secure_filename
+from data_balancer import DatasetBalancer
 
 app = Flask(__name__)
-CORS(app)
+app.secret_key = 'your_secret_key_here'
+app.config['UPLOAD_FOLDER'] = 'uploads'
+app.config['PROCESSED_FOLDER'] = 'processed'
+app.config['ALLOWED_EXTENSIONS'] = {'csv', 'xls', 'xlsx'}
 
-class Optimizer(ast.NodeTransformer):
-    def __init__(self):
-        super().__init__()
-        self.changes = 0
+# Create directories if they don't exist
+os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+os.makedirs(app.config['PROCESSED_FOLDER'], exist_ok=True)
 
-    def visit_BinOp(self, node):
-        self.generic_visit(node)
-        # Remove identity operations like x * 1, x + 0
-        if isinstance(node.op, ast.Mult) and isinstance(node.right, ast.Constant) and node.right.value == 1:
-            self.changes += 1
-            return node.left
-        if isinstance(node.op, ast.Add) and isinstance(node.right, ast.Constant) and node.right.value == 0:
-            self.changes += 1
-            return node.left
-        return node
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-    def visit_Compare(self, node):
-        self.generic_visit(node)
-        # Simplify comparisons like x == True -> x
-        if (isinstance(node.ops[0], ast.Eq) and
-                isinstance(node.comparators[0], ast.Constant)):
-            if node.comparators[0].value is True:
-                self.changes += 1
-                return node.left
-            elif node.comparators[0].value is False:
-                self.changes += 1
-                return ast.UnaryOp(op=ast.Not(), operand=node.left)
-        return node
+@app.route('/', methods=['GET', 'POST'])
+def upload_file():
+    if request.method == 'POST':
+        # Check if the post request has the file part
+        if 'file' not in request.files:
+            flash('No file part')
+            return redirect(request.url)
+        
+        file = request.files['file']
+        target_column = request.form.get('target_column', 'target')
+        
+        # If user does not select file, browser submits empty file
+        if file.filename == '':
+            flash('No selected file')
+            return redirect(request.url)
+        
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            upload_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+            file.save(upload_path)
+            
+            try:
+                # Process the file
+                balancer = DatasetBalancer(target_column=target_column)
+                shape, class_dist = balancer.load_data(upload_path)
+                balancer.preprocess()
+                balanced_df = balancer.balance()
+                
+                # Save processed file
+                processed_filename = f"balanced_{filename}"
+                processed_path = os.path.join(app.config['PROCESSED_FOLDER'], processed_filename)
+                balanced_df.to_csv(processed_path, index=False)
+                
+                return render_template('index.html', 
+                                    original_shape=shape,
+                                    original_dist=class_dist,
+                                    processed_file=processed_filename,
+                                    target_column=target_column)
+            
+            except Exception as e:
+                flash(str(e))
+                return redirect(request.url)
+    
+    return render_template('index.html')
 
-def optimize_python_code(code):
-    try:
-        tree = ast.parse(code)
-        optimizer = Optimizer()
-        optimized_tree = optimizer.visit(tree)
-        optimized_code = astor.to_source(optimized_tree)
-
-        # Calculate optimization score
-        score = min(100, optimizer.changes * 20)  # each change ~20%
-        comments = f"# Detected and applied {optimizer.changes} optimization(s)"
-
-        return {
-            'optimized_code': optimized_code + "\n" + comments,
-            'before_time': 'O(n²)',
-            'after_time': 'O(n log n)' if optimizer.changes else 'O(n²)',
-            'before_space': 'O(n)',
-            'after_space': 'O(1)' if optimizer.changes else 'O(n)',
-            'improvement_percent': str(score),
-            'time_improvement': f'{score + 5}% faster' if score else 'No change',
-            'space_improvement': f'{min(score, 70)}% less memory' if score else 'No change'
-        }
-    except Exception as e:
-        return {
-            'optimized_code': f'# Optimization failed: {str(e)}',
-            'before_time': 'Error',
-            'after_time': 'Error',
-            'before_space': 'Error',
-            'after_space': 'Error',
-            'improvement_percent': '0',
-            'time_improvement': 'N/A',
-            'space_improvement': 'N/A'
-        }
-
-@app.route('/optimize', methods=['POST'])
-def optimize_code():
-    try:
-        data = request.get_json()
-        language = data.get('language', 'python')
-        code = data.get('code', '')
-
-        if language == 'python':
-            result = optimize_python_code(code)
-        else:
-            # Default mock logic for other languages
-            result = {
-                'optimized_code': f"// Optimized {language} Code\n{code}\n// Optimization comments would appear here",
-                'before_time': 'O(n²)',
-                'after_time': 'O(n)',
-                'before_space': 'O(n)',
-                'after_space': 'O(1)',
-                'improvement_percent': '60',
-                'time_improvement': '70% faster',
-                'space_improvement': '65% less memory'
-            }
-
-        return jsonify(result)
-
-    except Exception as e:
-        return jsonify({
-            'error': str(e),
-            'optimized_code': f'Error during optimization: {str(e)}',
-            'before_time': 'Error',
-            'after_time': 'Error',
-            'before_space': 'Error',
-            'after_space': 'Error',
-            'improvement_percent': '0',
-            'time_improvement': 'N/A',
-            'space_improvement': 'N/A'
-        }), 500
-
-@app.route('/')
-def index():
-    return """
-    <h1>Code Optimizer API</h1>
-    <p>The API is running. Use the frontend interface to interact with the optimizer.</p>
-    <p>Make sure your frontend is making POST requests to /optimize endpoint.</p>
-    """
+@app.route('/download/<filename>')
+def download_file(filename):
+    return send_from_directory(app.config['PROCESSED_FOLDER'], filename, as_attachment=True)
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run(debug=True)
